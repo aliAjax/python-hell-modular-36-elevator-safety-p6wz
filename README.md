@@ -35,9 +35,27 @@ curl http://127.0.0.1:8336/health
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
 
-身份通过`X-User-Id`和`X-Role`请求头传入，角色和动作权限由规则引擎校验。## 核心流程
+身份通过`X-User-Id`和`X-Role`请求头传入，角色和动作权限由规则引擎校验；维保班组身份可用`X-Team`请求头传入（缺省按用户ID计），用于转派和完工的归属校验。## 核心流程
 
 创建设备后安排检验、维保和困人报警；报警派发救援任务，完成后才能解决。整改证据通过复核后关闭，恢复运行许可必须基于有效的检验和已关闭整改。
+
+## 维保单转派
+
+进行中的维保单可以转派给另一班组，无需重开工单：
+
+```bash
+curl -X POST http://127.0.0.1:8336/api/entities/<maintenance_id>/actions \
+  -H "X-User-Id: tech-a" -H "X-Role: maintenance" -H "X-Team: Team-A" \
+  -d '{"action":"transfer","expected_version":2,"data":{
+        "to_team":"Team-B","part_serials":["SN-1","SN-2"],
+        "completed_steps":["open_cover","replace_part"],"transfer_id":"t-1"}}'
+```
+
+- 原班提交时带`to_team`、`part_serials`和`completed_steps`；接手方从`current_step`继续作业。
+- 转派在同一事务内更新维保单、设备状态（进行中工单转派时设备转为/保持`suspended`）和审计记录，写入失败整体回滚，可安全重试；带相同`transfer_id`的重试幂等返回。
+- 两人同时转派同一维保单只有一笔成功，另一笔收到`409`（已被接手）。
+- 转派后旧班组提交完工会被拒绝（`403`），只有当前归属班组（或admin/dispatcher）能完工。
+- 部件序列号在未完工维保单间唯一：创建和转派时若序列号已挂在其他未结束工单上，退回并说明冲突的序列号与工单号，同时在审计中记录`transfer_rejected`及原因。
 
 ## 规则重点
 

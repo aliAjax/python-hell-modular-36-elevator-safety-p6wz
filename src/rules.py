@@ -34,6 +34,37 @@ def _positive(value, field):
     return number
 
 
+MAINTENANCE_OPEN_STATUSES = ("planned", "in_progress")
+
+
+def _maintenance_serials(entity):
+    data = entity["data"]
+    serials = []
+    single = data.get("part_serial")
+    if single:
+        serials.append(str(single))
+    for serial in data.get("part_serials") or []:
+        serial = str(serial)
+        if serial not in serials:
+            serials.append(serial)
+    return serials
+
+
+def _check_serial_conflicts(serials, lookup, exclude_id):
+    wanted = {str(serial) for serial in serials}
+    if not wanted:
+        return
+    for other in _all(lookup, "maintenance"):
+        if other["id"] == exclude_id or other["status"] not in MAINTENANCE_OPEN_STATUSES:
+            continue
+        clash = sorted(wanted & set(_maintenance_serials(other)))
+        if clash:
+            raise ConflictError(
+                "part_serial %s is already attached to open maintenance %s"
+                % (clash[0], other["id"])
+            )
+
+
 def _validate_equipment(data, lookup):
     asset_no = str(data.get("asset_no", "")).strip()
     if not asset_no:
@@ -54,13 +85,23 @@ def _validate_inspection(data, lookup):
     _positive(data.get("cycle_days"), "cycle_days")
 
 
-def _validate_maintenance(data, lookup):
+def _validate_maintenance(actor, data, lookup):
     if not _find_one(lookup, "equipment", "id", data.get("equipment_id")):
         raise ValidationError("maintenance requires equipment")
     if data.get("work_type") not in ("routine", "repair", "component_replacement", "modernization"):
         raise ValidationError("invalid work_type")
     if data.get("work_type") == "component_replacement" and not data.get("part_serial"):
         raise ValidationError("part_serial is required for component replacement")
+    serials = []
+    if data.get("part_serial"):
+        serials.append(str(data["part_serial"]))
+    for serial in data.get("part_serials") or []:
+        serials.append(str(serial))
+    _check_serial_conflicts(serials, lookup, exclude_id=None)
+    if not data.get("assigned_team"):
+        team = data.get("team") or (actor.effective_team if actor.role == "maintenance" else None)
+        if team:
+            data["assigned_team"] = team
 
 
 def _validate_alarm(data, lookup):
@@ -124,6 +165,13 @@ def _complete_rescue(actor, entity, data, lookup):
     if not jobs or any(job["status"] not in ("completed", "aborted") for job in jobs):
         raise ConflictError("alarm cannot close before rescue jobs are complete")
     return {"resolved_by": actor.user_id}
+
+
+def _complete_maintenance(actor, entity, data, lookup):
+    team = entity["data"].get("assigned_team")
+    if actor.role == "maintenance" and team and actor.effective_team != team:
+        raise PermissionDenied("maintenance order is assigned to team " + str(team))
+    return {}
 
 
 class RuleEngine:
@@ -229,7 +277,7 @@ class RuleEngine:
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
         "inspection": lambda a, d, l: _validate_inspection(d, l),
-        "maintenance": lambda a, d, l: _validate_maintenance(d, l),
+        "maintenance": lambda a, d, l: _validate_maintenance(a, d, l),
         "alarm": lambda a, d, l: _validate_alarm(d, l),
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
@@ -239,6 +287,7 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("maintenance", "complete"): _complete_maintenance,
     }
 
     def normalize_kind(self, kind):
@@ -278,3 +327,68 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_transfer(self, actor, entity, data, lookup=None):
+        """Validate a maintenance handover and build the patch for the receiving team."""
+        if self.normalize_kind(entity["kind"]) != "maintenance":
+            raise InvalidTransition("transfer only applies to maintenance")
+        if entity["status"] not in MAINTENANCE_OPEN_STATUSES:
+            raise InvalidTransition("cannot transfer maintenance from status " + entity["status"])
+        _ensure_role(actor, ("admin", "maintenance"))
+        _require(data, ("to_team", "part_serials"))
+        if "completed_steps" not in data:
+            raise ValidationError("missing required field: completed_steps")
+        current_team = entity["data"].get("assigned_team")
+        if actor.role == "maintenance" and current_team and actor.effective_team != current_team:
+            raise ConflictError("maintenance order already transferred to team " + str(current_team))
+        to_team = str(data.get("to_team")).strip()
+        if not to_team:
+            raise ValidationError("to_team is required")
+        if current_team and to_team == current_team:
+            raise ValidationError("maintenance order is already assigned to team " + to_team)
+        serials = data.get("part_serials")
+        if not isinstance(serials, list) or not serials:
+            raise ValidationError("part_serials must be a non-empty list")
+        serials = [str(serial).strip() for serial in serials]
+        if any(not serial for serial in serials):
+            raise ValidationError("part_serials must not contain empty values")
+        completed = data.get("completed_steps")
+        if not isinstance(completed, list):
+            raise ValidationError("completed_steps must be a list")
+        completed = [str(step) for step in completed]
+        planned = entity["data"].get("steps") or []
+        unknown = [step for step in completed if planned and step not in planned]
+        if unknown:
+            raise ValidationError("unknown step: " + unknown[0])
+        _check_serial_conflicts(serials, lookup, exclude_id=entity["id"])
+        merged_serials = _maintenance_serials(entity)
+        for serial in serials:
+            if serial not in merged_serials:
+                merged_serials.append(serial)
+        merged_steps = list(entity["data"].get("completed_steps") or [])
+        for step in completed:
+            if step not in merged_steps:
+                merged_steps.append(step)
+        history = list(entity["data"].get("transfer_history") or [])
+        history.append({
+            "from_team": current_team,
+            "to_team": to_team,
+            "by": actor.user_id,
+            "at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "transfer_id": data.get("transfer_id"),
+            "note": data.get("note"),
+        })
+        patch = {
+            "assigned_team": to_team,
+            "part_serials": merged_serials,
+            "completed_steps": merged_steps,
+            "current_step": next((step for step in planned if step not in merged_steps), None),
+            "transfer_history": history,
+        }
+        if data.get("transfer_id"):
+            patch["last_transfer_id"] = data["transfer_id"]
+        if data.get("to_user"):
+            patch["assigned_user"] = str(data["to_user"])
+        if data.get("note"):
+            patch["handover_note"] = str(data["note"])
+        return entity["status"], patch

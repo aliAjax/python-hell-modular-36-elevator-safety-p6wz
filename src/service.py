@@ -2,7 +2,13 @@ import hashlib
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .domain import (
+    ConflictError,
+    InvalidTransition,
+    NotFoundError,
+    PermissionDenied,
+    ValidationError,
+)
 from .rules import RuleEngine
 
 
@@ -42,6 +48,8 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        if action == "transfer" and self.rules.normalize_kind(entity["kind"]) == "maintenance":
+            return self.transfer_maintenance(actor, entity_id, data, expected_version)
         expected = int(expected_version) if expected_version is not None else entity["version"]
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
@@ -58,6 +66,111 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    @staticmethod
+    def _audit_entry(entity_id, actor, action, from_status, to_status, detail):
+        return {
+            "entity_id": entity_id,
+            "actor_id": actor.user_id,
+            "actor_role": actor.role,
+            "action": action,
+            "from_status": from_status,
+            "to_status": to_status,
+            "detail": detail,
+        }
+
+    @staticmethod
+    def _transfer_conflict(entity, actor, expected):
+        team = entity["data"].get("assigned_team")
+        if team and team != actor.effective_team:
+            return ConflictError("maintenance order already transferred to team " + str(team))
+        return ConflictError(
+            "version conflict: expected %s, found %s" % (expected, entity["version"])
+        )
+
+    def _maintenance_equipment(self, entity):
+        equipment_id = entity["data"].get("equipment_id")
+        if not equipment_id:
+            return None
+        rows = self._lookup("equipment", "id", equipment_id)
+        return rows[0] if rows else None
+
+    def _audit_transfer_rejected(self, actor, entity, payload, exc):
+        try:
+            self.audit.record(
+                entity["id"],
+                actor,
+                "transfer_rejected",
+                entity["status"],
+                entity["status"],
+                {
+                    "reason": str(exc),
+                    "to_team": payload.get("to_team"),
+                    "part_serials": payload.get("part_serials"),
+                },
+            )
+        except Exception:
+            pass  # best effort: the rejection audit must not mask the domain error
+
+    def transfer_maintenance(self, actor, entity_id, data=None, expected_version=None):
+        """Hand an in-flight maintenance order over to another team.
+
+        The order (assignee, part serials, completed steps), the equipment
+        status (kept suspended) and the audit trail are written in one
+        transaction, so a failed write leaves no partial state and the caller
+        can retry. Passing a unique ``transfer_id`` makes retries idempotent.
+        """
+        entity = self.repository.get_entity(entity_id)
+        if not entity:
+            raise NotFoundError("entity not found: " + entity_id)
+        if self.rules.normalize_kind(entity["kind"]) != "maintenance":
+            raise InvalidTransition("transfer only applies to maintenance")
+        payload = dict(data or {})
+        transfer_id = payload.get("transfer_id")
+        if transfer_id and entity["data"].get("last_transfer_id") == transfer_id:
+            return entity
+        expected = int(expected_version) if expected_version is not None else entity["version"]
+        if expected != entity["version"]:
+            raise self._transfer_conflict(entity, actor, expected)
+        try:
+            next_status, patch = self.rules.validate_transfer(actor, entity, payload, self._lookup)
+        except ConflictError as exc:
+            self._audit_transfer_rejected(actor, entity, payload, exc)
+            raise
+        merged = dict(entity["data"])
+        merged.update(patch)
+        updates = [
+            {"id": entity_id, "expected_version": expected, "status": next_status, "data": merged}
+        ]
+        audits = [
+            self._audit_entry(entity_id, actor, "transfer", entity["status"], next_status, {
+                "from_team": entity["data"].get("assigned_team"),
+                "to_team": patch["assigned_team"],
+                "part_serials": payload.get("part_serials"),
+                "completed_steps": payload.get("completed_steps"),
+                "transfer_id": transfer_id,
+            })
+        ]
+        equipment = self._maintenance_equipment(entity)
+        if equipment and entity["status"] == "in_progress" and equipment["status"] == "in_service":
+            updates.append({
+                "id": equipment["id"],
+                "expected_version": equipment["version"],
+                "status": "suspended",
+                "data": dict(equipment["data"]),
+            })
+            audits.append(self._audit_entry(
+                equipment["id"], actor, "suspend", "in_service", "suspended",
+                {"reason": "maintenance_transfer", "maintenance_id": entity_id},
+            ))
+        try:
+            self.repository.apply_atomic(updates, audits)
+        except ConflictError:
+            current = self.repository.get_entity(entity_id)
+            if current:
+                raise self._transfer_conflict(current, actor, expected)
+            raise
+        return self.repository.get_entity(entity_id)
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""
