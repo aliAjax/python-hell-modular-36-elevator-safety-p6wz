@@ -126,6 +126,69 @@ def _complete_rescue(actor, entity, data, lookup):
     return {"resolved_by": actor.user_id}
 
 
+def _start_maintenance(actor, entity, data, lookup):
+    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
+    if not equipment or equipment["status"] != "suspended":
+        raise ConflictError("equipment must be suspended before starting maintenance")
+    return {"assigned_to": actor.team or actor.user_id}
+
+
+def _handoff_maintenance(actor, entity, data, lookup):
+    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
+    if not equipment or equipment["status"] != "suspended":
+        raise ConflictError("equipment must be suspended before handoff")
+    part_serial = data.get("part_serial")
+    if entity["data"].get("work_type") == "component_replacement" and not part_serial:
+        raise ValidationError("part_serial is required for component replacement handoff")
+    completed_steps = data.get("completed_steps")
+    if not isinstance(completed_steps, list):
+        raise ValidationError("completed_steps must be a list")
+    to_team = data.get("to_team")
+    if not to_team:
+        raise ValidationError("to_team is required")
+    for maint in _all(lookup, "maintenance"):
+        if (
+            maint["id"] != entity["id"]
+            and maint["status"] != "completed"
+            and maint["data"].get("part_serial") == part_serial
+        ):
+            raise ConflictError(
+                "part_serial already attached to another active maintenance: " + maint["id"]
+            )
+    return {
+        "part_serial": part_serial,
+        "completed_steps": completed_steps,
+        "assigned_to": entity["data"].get("assigned_to"),
+        "handoff": {
+            "from_team": entity["data"].get("assigned_to"),
+            "to_team": to_team,
+            "reason": data.get("reason", ""),
+            "handed_off_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "status": "pending",
+        },
+    }
+
+
+def _accept_maintenance(actor, entity, data, lookup):
+    handoff = entity["data"].get("handoff", {})
+    return {
+        "assigned_to": handoff.get("to_team"),
+        "handoff": {
+            **handoff,
+            "status": "accepted",
+            "accepted_by": actor.user_id,
+            "accepted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    }
+
+
+def _complete_maintenance(actor, entity, data, lookup):
+    assigned_to = entity["data"].get("assigned_to")
+    if actor.role != "admin" and actor.team != assigned_to:
+        raise PermissionDenied("only the assigned team can complete this maintenance")
+    return {"completed_by": actor.user_id}
+
+
 class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
@@ -150,6 +213,8 @@ class RuleEngine:
         },
         "maintenance": {
             "start": (("planned",), "in_progress"),
+            "handoff": (("in_progress",), "handing_over"),
+            "accept": (("handing_over",), "in_progress"),
             "complete": (("in_progress",), "completed"),
         },
         "alarm": {
@@ -188,6 +253,7 @@ class RuleEngine:
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
         ("inspection", "fail"): ("findings",),
+        ("maintenance", "handoff"): ("part_serial", "completed_steps", "to_team"),
         ("maintenance", "complete"): ("completed_at",),
         ("rescue_job", "complete"): ("outcome",),
         ("remediation", "submit_evidence"): ("evidence",),
@@ -211,6 +277,8 @@ class RuleEngine:
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
         "start": ("admin", "maintenance"),
+        "handoff": ("admin", "maintenance"),
+        "accept": ("admin", "maintenance"),
         "complete": ("admin", "maintenance", "dispatcher"),
         "dispatch": ("admin", "dispatcher"),
         "mark_false": ("admin", "dispatcher", "inspector"),
@@ -239,6 +307,10 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("maintenance", "start"): _start_maintenance,
+        ("maintenance", "handoff"): _handoff_maintenance,
+        ("maintenance", "accept"): _accept_maintenance,
+        ("maintenance", "complete"): _complete_maintenance,
     }
 
     def normalize_kind(self, kind):

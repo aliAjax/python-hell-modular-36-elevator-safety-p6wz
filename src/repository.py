@@ -160,6 +160,72 @@ class SQLiteRepository:
                 ),
             )
 
+    def handoff_update(self, maintenance_id, expected_version, maintenance_status, maintenance_data,
+                       equipment_id, equipment_status, equipment_data, audit_entries):
+        """Atomically update maintenance + equipment + audit in one transaction."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now = utcnow()
+            mrow = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (maintenance_id,)
+            ).fetchone()
+            if not mrow:
+                raise NotFoundError("entity not found: " + maintenance_id)
+            m_version = int(mrow["version"])
+            if expected_version is not None and m_version != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, m_version)
+                )
+            erow = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (equipment_id,)
+            ).fetchone()
+            if not erow:
+                raise NotFoundError("entity not found: " + equipment_id)
+            e_version = int(erow["version"])
+            part_serial = maintenance_data.get("part_serial")
+            if part_serial:
+                rows = connection.execute(
+                    "SELECT id, data FROM entities WHERE kind = 'maintenance' AND status != 'completed' AND id != ?",
+                    (maintenance_id,),
+                ).fetchall()
+                for row in rows:
+                    if json.loads(row["data"]).get("part_serial") == part_serial:
+                        raise ConflictError(
+                            "part_serial already attached to another active maintenance: " + row["id"]
+                        )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (maintenance_status, json.dumps(maintenance_data, ensure_ascii=False, sort_keys=True),
+                 now, maintenance_id, m_version),
+            )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (equipment_status, json.dumps(equipment_data, ensure_ascii=False, sort_keys=True),
+                 now, equipment_id, e_version),
+            )
+            for entry in audit_entries:
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry["entity_id"], entry["actor_id"], entry["actor_role"],
+                        entry["action"], entry["from_status"], entry["to_status"],
+                        json.dumps(entry["detail"], ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(maintenance_id), self.get_entity(equipment_id)
+
     def list_audit(self, entity_id=None):
         with self._connect() as connection:
             if entity_id:

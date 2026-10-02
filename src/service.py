@@ -43,11 +43,17 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
+        if expected_version is not None and expected != entity["version"]:
+            raise ConflictError(
+                "version conflict: expected %s, found %s" % (expected, entity["version"])
+            )
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
         merged = dict(entity["data"])
         merged.update(patch)
+        if action == "handoff":
+            return self._handoff(actor, entity, expected, next_status, merged)
         updated = self.repository.update_entity(entity_id, expected, next_status, merged)
         self.audit.record(
             entity_id,
@@ -58,6 +64,45 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    def _handoff(self, actor, maintenance, expected_version, next_status, merged):
+        equipment_id = maintenance["data"].get("equipment_id")
+        equipment = self.repository.get_entity(equipment_id)
+        if not equipment:
+            raise NotFoundError("entity not found: " + equipment_id)
+        equipment_data = dict(equipment["data"])
+        equipment_data["last_handoff"] = maintenance["id"]
+        audit_entries = [
+            {
+                "entity_id": maintenance["id"],
+                "actor_id": actor.user_id,
+                "actor_role": actor.role,
+                "action": "handoff",
+                "from_status": maintenance["status"],
+                "to_status": next_status,
+                "detail": {"patch": merged},
+            },
+            {
+                "entity_id": equipment_id,
+                "actor_id": actor.user_id,
+                "actor_role": actor.role,
+                "action": "handoff_ref",
+                "from_status": equipment["status"],
+                "to_status": equipment["status"],
+                "detail": {"maintenance_id": maintenance["id"]},
+            },
+        ]
+        updated_maintenance, _ = self.repository.handoff_update(
+            maintenance["id"],
+            expected_version,
+            next_status,
+            merged,
+            equipment_id,
+            equipment["status"],
+            equipment_data,
+            audit_entries,
+        )
+        return updated_maintenance
 
     def merge_offline(self, actor, records):
         """Merge field records by a stable (source_id, record_id) identity."""
